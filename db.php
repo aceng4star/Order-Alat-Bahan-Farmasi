@@ -7,61 +7,108 @@ function getDbConnection() {
         return $pdo;
     }
 
-    try {
-        // Coba hubungkan ke MySQL/MariaDB
-        $dsnWithoutDb = "mysql:host=" . DB_HOST . ";charset=" . DB_CHARSET;
-        $tempPdo = new PDO($dsnWithoutDb, DB_USER, DB_PASS, [
-            PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION,
-            PDO::ATTR_TIMEOUT => 2
-        ]);
-        
-        $dbName = DB_NAME;
-        $tempPdo->exec("CREATE DATABASE IF NOT EXISTS `$dbName` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci");
-        $tempPdo = null;
+    // Cek apakah driver pdo_mysql tersedia
+    $mysqlAvailable = in_array('mysql', PDO::getAvailableDrivers());
+    $sqliteAvailable = in_array('sqlite', PDO::getAvailableDrivers());
 
-        // Hubungkan ke database sesungguhnya
-        $dsn = "mysql:host=" . DB_HOST . ";dbname=" . DB_NAME . ";charset=" . DB_CHARSET;
-        $pdo = new PDO($dsn, DB_USER, DB_PASS, [
-            PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION,
-            PDO::ATTR_DEFAULT_FETCH_MODE => PDO::FETCH_ASSOC,
-            PDO::ATTR_EMULATE_PREPARES => false
-        ]);
-        
-        // Jalankan inisialisasi tabel & seeder
-        initDatabase($pdo);
-        
-        return $pdo;
-    } catch (PDOException $e) {
-        // Jika koneksi MySQL gagal, fall back ke SQLite
+    // --- Coba koneksi MySQL / MariaDB ---
+    if ($mysqlAvailable) {
+        try {
+            // Buat database jika belum ada (perlu hak CREATE DATABASE)
+            try {
+                $dsnWithoutDb = "mysql:host=" . DB_HOST . ";charset=" . DB_CHARSET;
+                $tempPdo = new PDO($dsnWithoutDb, DB_USER, DB_PASS, [
+                    PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION,
+                    PDO::ATTR_TIMEOUT => 3
+                ]);
+                $dbName = DB_NAME;
+                $tempPdo->exec("CREATE DATABASE IF NOT EXISTS `$dbName` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci");
+                $tempPdo = null;
+            } catch (PDOException $createEx) {
+                // Abaikan jika tidak ada hak CREATE DATABASE, coba langsung connect
+            }
+
+            // Hubungkan ke database sesungguhnya
+            $dsn = "mysql:host=" . DB_HOST . ";dbname=" . DB_NAME . ";charset=" . DB_CHARSET;
+            $pdo = new PDO($dsn, DB_USER, DB_PASS, [
+                PDO::ATTR_ERRMODE            => PDO::ERRMODE_EXCEPTION,
+                PDO::ATTR_DEFAULT_FETCH_MODE => PDO::FETCH_ASSOC,
+                PDO::ATTR_EMULATE_PREPARES   => false
+            ]);
+
+            // Jalankan inisialisasi tabel & seeder
+            initDatabase($pdo);
+
+            return $pdo;
+
+        } catch (PDOException $e) {
+            // MySQL gagal — tidak fallback ke SQLite di production, lempar error nyata
+            dbFatalError(
+                "Koneksi MariaDB/MySQL Gagal: " . $e->getMessage() .
+                "\n\nPastikan:\n" .
+                "  1. MariaDB/MySQL berjalan: systemctl status mariadb\n" .
+                "  2. Kredensial di config.php benar (host=" . DB_HOST . ", user=" . DB_USER . ", db=" . DB_NAME . ")\n" .
+                "  3. User memiliki hak akses: GRANT ALL ON `" . DB_NAME . "`.* TO '" . DB_USER . "'@'localhost';"
+            );
+        }
+    }
+
+    // --- Fallback ke SQLite (development / lokal saja) ---
+    if ($sqliteAvailable) {
         try {
             $sqlitePath = __DIR__ . '/database.sqlite';
             $pdo = new PDO("sqlite:" . $sqlitePath, null, null, [
-                PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION,
+                PDO::ATTR_ERRMODE            => PDO::ERRMODE_EXCEPTION,
                 PDO::ATTR_DEFAULT_FETCH_MODE => PDO::FETCH_ASSOC
             ]);
-            
-            // Aktifkan Foreign Keys di SQLite
             $pdo->exec("PRAGMA foreign_keys = ON;");
-            
-            // Jalankan inisialisasi tabel & seeder khusus SQLite
             initDatabase($pdo);
-            
             return $pdo;
         } catch (PDOException $sqliteEx) {
-            if (str_contains($_SERVER['REQUEST_URI'] ?? '', 'api.php') || (defined('API_CALL') && API_CALL)) {
-                header('Content-Type: application/json');
-                http_response_code(500);
-                echo json_encode([
-                    'success' => false,
-                    'message' => 'Koneksi Database Gagal (MySQL & SQLite): ' . $sqliteEx->getMessage()
-                ]);
-                exit;
-            } else {
-                die("Koneksi Database Gagal (MySQL & SQLite): " . $sqliteEx->getMessage());
-            }
+            dbFatalError("Koneksi SQLite gagal: " . $sqliteEx->getMessage());
         }
     }
+
+    // --- Tidak ada driver sama sekali ---
+    dbFatalError(
+        "Tidak ada PDO driver database yang tersedia!\n\n" .
+        "Driver tersedia saat ini: [" . implode(', ', PDO::getAvailableDrivers()) . "]\n\n" .
+        "Untuk menginstall driver pada Debian/Ubuntu dengan PHP 8.4:\n\n" .
+        "  # Driver MySQL/MariaDB (WAJIB untuk production):\n" .
+        "  apt install php8.4-mysql\n\n" .
+        "  # Driver SQLite (opsional, untuk development/lokal):\n" .
+        "  apt install php8.4-sqlite3\n\n" .
+        "  # Setelah install, restart PHP-FPM:\n" .
+        "  systemctl restart php8.4-fpm\n\n" .
+        "  # Atau jika pakai Nginx + PHP-FPM versi lain:\n" .
+        "  systemctl restart php-fpm"
+    );
 }
+
+/**
+ * Tampilkan error fatal database — JSON jika dari API call, HTML jika dari browser.
+ */
+function dbFatalError(string $message): never {
+    $isApi = str_contains($_SERVER['REQUEST_URI'] ?? '', 'api.php') || (defined('API_CALL') && API_CALL);
+    if ($isApi) {
+        header('Content-Type: application/json');
+        http_response_code(500);
+        echo json_encode(['success' => false, 'message' => $message]);
+    } else {
+        http_response_code(500);
+        echo "<!DOCTYPE html><html><head><meta charset='utf-8'><title>Database Error</title>
+        <style>body{font-family:monospace;background:#0f172a;color:#f8fafc;padding:40px;max-width:800px;margin:0 auto;}
+        h2{color:#ef4444;}pre{background:#1e293b;padding:20px;border-radius:8px;border-left:4px solid #ef4444;white-space:pre-wrap;word-break:break-word;}
+        code{background:#334155;padding:2px 6px;border-radius:4px;color:#7dd3fc;}
+        </style></head><body>
+        <h2>&#9888; Koneksi Database Gagal</h2>
+        <pre>" . htmlspecialchars($message) . "</pre>
+        </body></html>";
+    }
+    exit;
+}
+
+
 
 // Inisialisasi Database dan Seeders
 function initDatabase($db) {
